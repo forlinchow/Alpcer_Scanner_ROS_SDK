@@ -1,3 +1,0 @@
-/root/ros2_ws/src/livox_color/cmake-build-debug/CMakeFiles/rebuild_cache.dir
-/root/ros2_ws/src/livox_color/cmake-build-debug/CMakeFiles/edit_cache.dir
-/root/ros2_ws/src/livox_color/cmake-build-debug/CMakeFiles/livox_color.dir
