@@ -47,8 +47,8 @@ git clone https://github.com/forlinchow/Alpcer_Scanner_ROS_SDK.git ws_livox/src/
 
 #### For ROS2 Foxy:
 ```shell
-source /opt/ros/foxy/setup.sh
 cd ws_livox
+source /opt/ros/foxy/setup.sh
 colcon build --packages-select livox_color
 ```
 
@@ -60,3 +60,16 @@ cd ws_livox
 source install/setup.sh
 ros2 run livox_color livox_color_node
 ```
+
+If you want to see point cloud in rviz2, in another shell:
+
+```shell
+source /opt/ros/foxy/setup.sh
+rviz2
+```
+
+## 3. FAQ
+
+### 3.1 run with "ros2 run livox_color livox_color_node" but no point cloud display on the rviz2 grid?
+
+Please check the "Global Options - Fixed Frame" field in the RViz "Display" pannel. Set the field value to "livox_frame" and check the "PointCloud2" option in the pannel.
