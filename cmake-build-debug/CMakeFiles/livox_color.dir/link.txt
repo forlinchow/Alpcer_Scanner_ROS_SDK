@@ -1,0 +1,1 @@
+/usr/bin/c++  -g   CMakeFiles/livox_color.dir/src/main.cpp.o  -o livox_color 
