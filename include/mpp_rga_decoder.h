@@ -1,5 +1,6 @@
 //
 // Created by Zachary on 2026/4/22.
+// 完全对齐 rkmppdec.c MJPEG 解码流程，修复引用计数错误
 //
 
 #ifndef LIVOX_COLOR_MPP_RGA_DECODER_H
@@ -9,130 +10,215 @@
 #include <rockchip/mpp_frame.h>
 #include <rockchip/mpp_packet.h>
 #include <rockchip/mpp_buffer.h>
-#include <rga/RgaApi.h>
+#include <rockchip/mpp_meta.h>
 #include <rga/im2d.h>
 #include <opencv2/opencv.hpp>
-#include <vector>
 #include <iostream>
+#include <cstring>
+
+#define MPP_ALIGN(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
 class MppRgaDecoder {
 public:
-    /**
-     * @param target_width 最终输出的图像宽度 (例如 4000)
-     * @param target_height 最终输出的图像高度 (例如 3000)
-     */
     MppRgaDecoder(int target_width, int target_height)
             : width_(target_width), height_(target_height) {
 
-        // 1. 初始化 MPP
-        mpp_create(&mpp_ctx_, &mpp_api_);
+        MPP_RET ret = mpp_create(&mpp_ctx_, &mpp_api_);
+        if (ret != MPP_OK) {
+            std::cerr << "Failed to create MPP context: " << ret << std::endl;
+            return;
+        }
 
-        // --- 关键配置 A: 开启分包模式 (Split Mode) ---
-        // 告诉 MPP 每一个 Packet 就是一个完整的图像，不要尝试去拼包
-        RK_U32 need_split = 1;
-        mpp_api_->control(mpp_ctx_, MPP_DEC_SET_PARSER_SPLIT_MODE, &need_split);
+        MppDecCfg cfg = nullptr;
+        mpp_dec_cfg_init(&cfg);
+        mpp_dec_cfg_set_u32(cfg, "base:split_parse", 1);
+        mpp_api_->control(mpp_ctx_, MPP_DEC_SET_CFG, cfg);
+        mpp_dec_cfg_deinit(cfg);
 
-        // --- 关键配置 B: 设置立即输出 ---
-        // 禁用延迟参考帧逻辑，这对单帧 JPEG 非常重要
-        RK_U32 immediate_out = 1;
-        mpp_api_->control(mpp_ctx_, MPP_DEC_SET_IMMEDIATE_OUT, &immediate_out);
+        ret = mpp_init(mpp_ctx_, MPP_CTX_DEC, MPP_VIDEO_CodingMJPEG);
+        if (ret != MPP_OK) {
+            std::cerr << "Failed to init MPP for MJPEG: " << ret << std::endl;
+            return;
+        }
 
-        // 此时再初始化 MJPEG
-        mpp_init(mpp_ctx_, MPP_CTX_DEC, MPP_VIDEO_CodingMJPEG);
+        mpp_buffer_group_get_internal(&mem_group_,
+                                      MPP_BUFFER_TYPE_DRM |
+                                      MPP_BUFFER_FLAGS_DMA32 |
+                                      MPP_BUFFER_FLAGS_CACHABLE);
 
-        // 关键配置 C: 增加 Parser 内部缓存限制 (防止因大图报-1012)
-        RK_U32 max_size = 10 * 1024 * 1024; // 10MB
-        mpp_api_->control(mpp_ctx_, MPP_DEC_SET_PARSER_SPLIT_MODE, &max_size);
+        allocate_buffers();
 
-        // 设置超时为阻塞模式 (50ms 超时，防止彻底卡死)
-        MppPollType timeout = MPP_POLL_BLOCK;
-        mpp_api_->control(mpp_ctx_, MPP_SET_OUTPUT_TIMEOUT, &timeout);
-
-        std::cout << "MPP Decoder initialized for Thread-Safe mode." << std::endl;
+        initialized_ = true;
+        std::cout << "MPP MJPEG Decoder initialized. Zero-Copy Ready." << std::endl;
     }
 
     ~MppRgaDecoder() {
-        if (mpp_ctx_) mpp_destroy(mpp_ctx_);
+        if (yuv_buf_) {
+            mpp_buffer_put(yuv_buf_);
+            yuv_buf_ = nullptr;
+        }
+        if (bgr_buf_) {
+            mpp_buffer_put(bgr_buf_);
+            bgr_buf_ = nullptr;
+        }
+        if (mem_group_) {
+            mpp_buffer_group_put(mem_group_);
+            mem_group_ = nullptr;
+        }
+        if (mpp_ctx_) {
+            mpp_destroy(mpp_ctx_);
+            mpp_ctx_ = nullptr;
+        }
     }
 
-    /**
-     * 在赋色线程调用此函数
-     * @param jpeg_data 已经拷贝出来的 JPEG 字节流
-     * @param size 字节流大小
-     * @param out_mat 预分配好的 BGR Mat
-     */
     bool decode(const uint8_t* jpeg_data, size_t size, cv::Mat& out_mat) {
-        if (!jpeg_data || size == 0) return false;
+        if (!initialized_ || !jpeg_data || size == 0) return false;
 
         MppPacket packet = nullptr;
-        MppFrame frame = nullptr;
+        MppBuffer pkt_buf = nullptr;
+        MppFrame output_frame = nullptr;
+        MPP_RET ret;
 
-        // 1. 初始化 Packet (内部会自动处理内存分配和拷贝)
-        mpp_packet_init(&packet, const_cast<uint8_t*>(jpeg_data), size);
+        // --- 1. 拷贝 JPEG 数据到 DMA 缓冲区 ---
+        ret = mpp_buffer_get(mem_group_, &pkt_buf, size);
+        if (ret != MPP_OK || !pkt_buf) {
+            std::cerr << "Failed to get buffer for packet: " << ret << std::endl;
+            return false;
+        }
 
-        // 设置 EOS 标志，告诉 MPP 这一包就是一个完整的帧
-        mpp_packet_set_eos(packet);
+        void* buf_ptr = mpp_buffer_get_ptr(pkt_buf);
+        if (!buf_ptr) {
+            mpp_buffer_put(pkt_buf);
+            return false;
+        }
+        memcpy(buf_ptr, jpeg_data, size);
 
-        // 2. 发送给硬解单元
-        MPP_RET ret = mpp_api_->decode_put_packet(mpp_ctx_, packet);
-        printf("after decode_put_packet\n");
+        // --- 2. 用 DMA 缓冲区初始化 Packet ---
+        ret = mpp_packet_init_with_buffer(&packet, pkt_buf);
+        mpp_buffer_put(pkt_buf);  // 释放本地引用，packet 已持有
         if (ret != MPP_OK) {
-            // 如果这里依然报 -1012，说明 MPP 内部 Parser 认为数据非法或太大
-            // 尝试重置解码器
-            mpp_api_->control(mpp_ctx_, MPP_DEC_SET_IMMEDIATE_OUT, nullptr);
+            std::cerr << "Failed to init packet with buffer: " << ret << std::endl;
+            return false;
+        }
+
+        // --- 3. 创建输出 Frame，绑定 yuv_buf_，注入到 packet meta ---
+        ret = mpp_frame_init(&output_frame);
+        if (ret != MPP_OK) {
+            std::cerr << "Failed to init output frame: " << ret << std::endl;
             mpp_packet_deinit(&packet);
-            printf("decode fail 1, %d\n", ret);
-            printf("JPEG Header: %02x %02x, Size: %zu\n", jpeg_data[0], jpeg_data[1], size);
+            return false;
+        }
+        mpp_frame_set_buffer(output_frame, yuv_buf_);
+
+        MppMeta meta = mpp_packet_get_meta(packet);
+        if (!meta) {
+            mpp_frame_deinit(&output_frame);
+            mpp_packet_deinit(&packet);
+            return false;
+        }
+        ret = mpp_meta_set_frame(meta, KEY_OUTPUT_FRAME, output_frame);
+        if (ret != MPP_OK) {
+            std::cerr << "Failed to set output frame in meta: " << ret << std::endl;
+            mpp_frame_deinit(&output_frame);
+            mpp_packet_deinit(&packet);
             return false;
         }
 
-        // 3. 获取解码后的帧 (NV12)
-        ret = mpp_api_->decode_get_frame(mpp_ctx_, &frame);
-        printf("after decode_get_frame\n");
+        // --- 4. 发送到解码器（成功则 output_frame 所有权转移）---
+        ret = mpp_api_->decode_put_packet(mpp_ctx_, packet);
+        mpp_packet_deinit(&packet);
 
-        if (ret == MPP_OK && frame) {
-            // 4. 使用 RGA 硬件进行格式转换与缩放
-            process_with_rga(frame, out_mat);
-            printf("after process_with_rga\n");
-            mpp_frame_deinit(&frame);
-        } else {
-            if (packet) mpp_packet_deinit(&packet);
-            printf("decode fail 2, %d\n", ret);
+        if (ret != MPP_OK) {
+            std::cerr << "decode_put_packet failed: " << ret << std::endl;
+            mpp_frame_deinit(&output_frame);  // 失败才需要释放
+            return false;
+        }
+        // 从这里开始，output_frame 不能再被用户代码释放，后续由 MPP 管理
+
+        // --- 5. 获取解码结果 ---
+        MppFrame result_frame = nullptr;
+        ret = mpp_api_->decode_get_frame(mpp_ctx_, &result_frame);
+        if (ret != MPP_OK || !result_frame) {
+            std::cerr << "decode_get_frame failed: " << ret << std::endl;
             return false;
         }
 
-        if (packet) mpp_packet_deinit(&packet);
-        printf("decode success\n");
-        return true;
+        // --- 6. 检查错误帧 ---
+        if (mpp_frame_get_errinfo(result_frame) != 0) {
+            std::cerr << "MPP returned an error frame!" << std::endl;
+            mpp_frame_deinit(&result_frame);
+            return false;
+        }
+
+        uint32_t actual_width  = mpp_frame_get_width(result_frame);
+        uint32_t actual_height = mpp_frame_get_height(result_frame);
+        MppFrameFormat fmt     = mpp_frame_get_fmt(result_frame);
+
+        // --- 7. RGA 转换 ---
+        bool success = process_with_rga(result_frame, actual_width, actual_height, fmt);
+
+        // --- 8. 只释放 result_frame ---
+        mpp_frame_deinit(&result_frame);
+
+        if (success) {
+            out_mat = cv::Mat(height_, width_, CV_8UC3, bgr_ptr_);
+        }
+        return success;
     }
 
 private:
     MppCtx mpp_ctx_ = nullptr;
     MppApi *mpp_api_ = nullptr;
     int width_, height_;
+    bool initialized_ = false;
 
-    void process_with_rga(MppFrame frame, cv::Mat& out_mat) {
-        if (out_mat.empty()) {
-            out_mat.create(height_, width_, CV_8UC3);
+    MppBufferGroup mem_group_ = nullptr;
+    MppBuffer yuv_buf_ = nullptr;
+    MppBuffer bgr_buf_ = nullptr;
+    int bgr_fd_ = -1;
+    void* bgr_ptr_ = nullptr;
+
+    void allocate_buffers() {
+        uint32_t hor_stride = MPP_ALIGN(width_, 16);
+        uint32_t ver_stride = MPP_ALIGN(height_, 16);
+
+        size_t yuv_size = hor_stride * ver_stride * 4;
+        mpp_buffer_get(mem_group_, &yuv_buf_, yuv_size);
+
+        size_t bgr_size = width_ * height_ * 3;
+        mpp_buffer_get(mem_group_, &bgr_buf_, bgr_size);
+        bgr_fd_  = mpp_buffer_get_fd(bgr_buf_);
+        bgr_ptr_ = mpp_buffer_get_ptr(bgr_buf_);
+    }
+
+    bool process_with_rga(MppFrame decoded_frame,
+                          uint32_t fw, uint32_t fh,
+                          MppFrameFormat fmt) {
+        int src_fd        = mpp_buffer_get_fd(yuv_buf_);
+        uint32_t hor_stride = mpp_frame_get_hor_stride(decoded_frame);
+        uint32_t ver_stride = mpp_frame_get_ver_stride(decoded_frame);
+
+        int rga_src_fmt;
+        switch (fmt & MPP_FRAME_FMT_MASK) {
+            case MPP_FMT_YUV420SP: rga_src_fmt = RK_FORMAT_YCbCr_420_SP; break;
+            case MPP_FMT_YUV422SP: rga_src_fmt = RK_FORMAT_YCbCr_422_SP; break;
+            case MPP_FMT_YUV420P:  rga_src_fmt = RK_FORMAT_YCbCr_420_P;  break;
+            case MPP_FMT_YUV422P:  rga_src_fmt = RK_FORMAT_YCbCr_422_P;  break;
+            default:
+                std::cerr << "Unsupported MPP format: " << (fmt & MPP_FRAME_FMT_MASK) << std::endl;
+                return false;
         }
-        uint32_t fw = mpp_frame_get_width(frame);
-        uint32_t fh = mpp_frame_get_height(frame);
-        uint32_t fs_h = mpp_frame_get_hor_stride(frame);
-        uint32_t fs_v = mpp_frame_get_ver_stride(frame);
-        MppBuffer mpp_buf = mpp_frame_get_buffer(frame);
-        int mpp_fd = mpp_buffer_get_fd(mpp_buf);
 
-        // 输入：MPP硬解出的 NV12 (通过 fd 引用，零拷贝)
-        rga_buffer_t src_img = wrapbuffer_fd(mpp_fd, (int)fw, (int)fh,
-                                             RK_FORMAT_YCbCr_420_SP, (int)fs_h, (int)fs_v);
-
-        // 输出：OpenCV 的 BGR 内存
-        rga_buffer_t dst_img = wrapbuffer_virtualaddr(out_mat.data, out_mat.cols, out_mat.rows,
-                                                      RK_FORMAT_BGR_888);
-
-        // RGA 硬件执行转换 (NV12 -> BGR)
-        // 如果输入是 8K，out_mat 是 4K，imcvtcolor 会自动处理缩放
-        imcvtcolor(src_img, dst_img, src_img.format, dst_img.format);
+        rga_buffer_t src_img = wrapbuffer_fd(src_fd, (int)fw, (int)fh,
+                                             rga_src_fmt,
+                                             (int)hor_stride, (int)ver_stride);
+        rga_buffer_t dst_img = wrapbuffer_fd(bgr_fd_, width_, height_, RK_FORMAT_BGR_888);
+        IM_STATUS rga_ret = imcvtcolor(src_img, dst_img, src_img.format, dst_img.format);
+        if (rga_ret != IM_STATUS_SUCCESS) {
+            std::cerr << "RGA conversion failed: " << rga_ret << std::endl;
+            return false;
+        }
+        return true;
     }
 };
 

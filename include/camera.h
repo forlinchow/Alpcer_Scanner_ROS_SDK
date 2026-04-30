@@ -95,6 +95,7 @@ namespace CAMERA {
         std::vector<uchar> cached_image_raw;
         size_t bytesused_image_raw;
         long timestamp_image_raw;
+        cv::Mat cached_image;
 
     public:
         CameraInternal(std::string comName, uint32_t width, uint32_t height, uint32_t width_little, uint32_t height_little,  std::string cameraParamsPath) : comName(std::move(comName)), width(width), height(height), width_little(width_little), height_little(height_little), cameraParamsPath(std::move(cameraParamsPath)) {
@@ -110,7 +111,7 @@ namespace CAMERA {
             closeFd();
         }
 
-        void setAutoExposure(bool isAuto, bool wait_for_frame_update = false) {
+        inline void setAutoExposure(bool isAuto, bool wait_for_frame_update = false) {
             if (isAuto) {
                 if (!cur_is_auto) {
                     ctrl.id = V4L2_CID_EXPOSURE_AUTO;
@@ -172,7 +173,7 @@ namespace CAMERA {
             }
         }
 
-        void acquireFrame(std::vector<uchar>* p_buf = nullptr) {
+        inline void acquireFrame(std::vector<uchar>* p_buf = nullptr) {
             queueFrameBuffer();
             dequeueFrameBuffer();
             copyFrameData(p_buf);
@@ -220,7 +221,7 @@ namespace CAMERA {
             }
         }
 
-        size_t dequeueFrameBuffer() {
+        inline size_t dequeueFrameBuffer() {
             fd_set fds;
             struct timeval tv;
 
@@ -254,7 +255,7 @@ namespace CAMERA {
             return frameBuffer.bytesused;
         }
 
-        void queueFrameBuffer() {
+        inline void queueFrameBuffer() {
             if(ioctl(fd, VIDIOC_QBUF, &frameBuffer) < 0) {
                 throw std::runtime_error("放回队列失败");
             }
@@ -461,18 +462,53 @@ namespace CAMERA {
             spdlog::info("shootManualExposure end.\n");
         }
 
+        Mat decodeBufferFrameHASync(bool onlyValidRange, bool rotationCorrect, size_t bytesused = 0) {
+            Mat frame;
+            if (cur_width == width) {
+                if (pMppRgaDecoder != nullptr) {
+                    Mat frame2;
+
+                    long t = common_utils::currentTimeMilliseconds();
+                    if (!pMppRgaDecoder->decode(mptr[0], bytesused, frame2)) {
+                        spdlog::info("mpp decode fail, replace by opencv\n");
+                        copyFrameData();
+                        frame2 = imdecode(buf, ImreadModes::IMREAD_COLOR);
+                    }
+                    spdlog::info("image decoded, cost:{}s.\n", (common_utils::currentTimeMilliseconds()-t)/1000.0f);
+                    frame = onlyValidRange ? frame2(valid_row_range, valid_col_range) : frame2;
+                } else {
+                    copyFrameData();
+                    frame = onlyValidRange ? imdecode(buf, ImreadModes::IMREAD_COLOR)(valid_row_range, valid_col_range) : imdecode(buf, ImreadModes::IMREAD_COLOR);
+                }
+            } else {
+                copyFrameData();
+                Mat yuyv(cur_height, cur_width, CV_8UC2, buf.data()), bgr;
+                cvtColor(yuyv, bgr, COLOR_YUV2BGR_YUYV);
+                frame = onlyValidRange ? bgr(valid_row_range, valid_col_range) : bgr;
+            }
+
+            if (rotationCorrect) {
+                Mat frame2;
+                correctImageRotation(frame, frame2);
+                return frame2;
+            } else {
+                return frame;
+            }
+        }
+
         Mat decodeBufferFrameHA(bool onlyValidRange, bool rotationCorrect, std::vector<uchar>* p_buf = nullptr, size_t bytesused = 0) {
             Mat frame;
             if (cur_width == width) {
                 if (pMppRgaDecoder != nullptr && p_buf != nullptr) {
                     Mat frame2;
-                    spdlog::info("decodeBufferFrameHA 1\n");
+
+                    long t = common_utils::currentTimeMilliseconds();
                     if (!pMppRgaDecoder->decode(p_buf->data(), bytesused, frame2)) {
+                        spdlog::info("mpp decode fail, replace by opencv\n");
                         frame2 = imdecode(p_buf == nullptr ? buf : (*p_buf), ImreadModes::IMREAD_COLOR);
                     }
-                    spdlog::info("decodeBufferFrameHA 2\n");
+                    spdlog::info("image decoded, cost:{}s.\n", (common_utils::currentTimeMilliseconds()-t)/1000.0f);
                     frame = onlyValidRange ? frame2(valid_row_range, valid_col_range) : frame2;
-                    spdlog::info("decodeBufferFrameHA 3\n");
                 } else {
                     frame = onlyValidRange ? imdecode(p_buf == nullptr ? buf : (*p_buf), ImreadModes::IMREAD_COLOR)(valid_row_range, valid_col_range) : imdecode(p_buf == nullptr ? buf : (*p_buf), ImreadModes::IMREAD_COLOR);
                 }
@@ -488,6 +524,25 @@ namespace CAMERA {
                 return frame2;
             } else {
                 return frame;
+            }
+        }
+
+        inline cv::Mat shootAutoToCacheMatRealtime() {
+            setAutoExposure(true, false);
+            queueFrameBuffer();
+            size_t bytesused = dequeueFrameBuffer();
+            cv::Mat mat = decodeBufferFrameHASync(true, false, bytesused);
+            {
+                std::lock_guard<std::mutex> lock(camera_mutex);
+                cached_image = mat;
+            }
+            return mat;
+        }
+
+        inline void cachedImage(cv::Mat& mat) {
+            {
+                std::lock_guard<std::mutex> lock(camera_mutex);
+                mat = cached_image.clone();
             }
         }
 
@@ -515,7 +570,8 @@ namespace CAMERA {
                 timestamp = timestamp_image_raw;
             }
             long t = common_utils::currentTimeMilliseconds();
-            image = decodeBufferFrame(true, false, &cache);
+//            image = decodeBufferFrame(true, false, &cache);
+            image = decodeBufferFrameHA(true, false, &cache, bytesused);
             spdlog::info("decodeBufferFrame end, cost:{}s.\n", (common_utils::currentTimeMilliseconds()-t)/1000.0f);
             return true;
         }
@@ -1506,11 +1562,19 @@ namespace CAMERA {
             spdlog::info("Shooting auto images finished.\n");
         }
 
-        void shootAutoToCacheRealtime() {
+        inline Mat shootAutoToCacheMatRealtime() {
+            return cameraInternal->shootAutoToCacheMatRealtime();
+        }
+
+        inline void cachedImage(cv::Mat& mat) {
+            cameraInternal->cachedImage(mat);
+        }
+
+        inline void shootAutoToCacheRealtime() {
             cameraInternal->shootAutoToCacheRealtime();
         }
 
-        bool decodeRealtimeImage(cv::Mat& image, long& timestamp) {
+        inline bool decodeRealtimeImage(cv::Mat& image, long& timestamp) {
             return cameraInternal->decodeRealtimeImage(image, timestamp);
         }
 

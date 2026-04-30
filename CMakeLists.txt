@@ -8,6 +8,7 @@ add_compile_options(-lstdc++fs)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(cv_bridge REQUIRED)
 
 find_package(Threads REQUIRED)
 find_package(OpenCV REQUIRED)
@@ -28,7 +29,7 @@ include_directories(include ${OpenCV_INCLUDE_DIRS})
 add_executable(livox_color_node src/main.cpp)
 
 # 添加依赖链接
-ament_target_dependencies(livox_color_node rclcpp sensor_msgs Threads OpenCV OpenMP)
+ament_target_dependencies(livox_color_node rclcpp sensor_msgs Threads OpenCV OpenMP cv_bridge)
 
 # 设置安装路径
 install(TARGETS livox_color_node
@@ -37,5 +38,10 @@ install(TARGETS livox_color_node
 target_link_libraries(livox_color_node
         ${LIVOX_SDK2_LIB} ${MPP_LIB} ${RGA_LIB} stdc++fs)
 
+# 安装 launch 文件夹及其所有内容
+install(DIRECTORY
+        launch
+        DESTINATION share/${PROJECT_NAME}
+        )
 ament_package()
 #colcon build --packages-select livox_color
