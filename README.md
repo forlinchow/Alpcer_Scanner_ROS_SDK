@@ -58,7 +58,7 @@ colcon build --packages-select livox_color
 ```shell
 cd ws_livox
 source install/setup.sh
-ros2 run livox_color livox_color_node
+ros2 launch livox_color livox_color_launch.py is_color:=true
 ```
 
 If you want to see point cloud in rviz2, in another shell:
